@@ -265,7 +265,7 @@ class DataFrame {
             .filter((group) => group);
     }
 
-    _join(dfToJoin, columnNames, types) {
+    _join(dfToJoin, columnNames, types, shouldDropDuplicates) {
         if (!(dfToJoin instanceof DataFrame))
             throw new ArgumentTypeError(dfToJoin, "DataFrame");
         const newColumns = [
@@ -276,7 +276,7 @@ class DataFrame {
             : [columnNames];
         const gdf = this.groupBy(...columns);
         const gdfToJoin = dfToJoin.groupBy(...columns);
-        return [
+        let res = [
             this.__newInstance__([], newColumns),
             ...iter(
                 [
@@ -290,8 +290,9 @@ class DataFrame {
                 (group) => group.restructure(newColumns)
             )
         ]
-            .reduce((p, n) => p.union(n))
-            .dropDuplicates();
+            .reduce((p, n) => p.union(n));
+
+        return shouldDropDuplicates ? res.dropDuplicates() : res;
     }
 
     _cleanSavePath(path) {
@@ -665,20 +666,35 @@ class DataFrame {
     }
 
     /**
-     * Rename a column.
-     * @param {String} columnName The column to rename.
-     * @param {String} replacement The new name for the column.
-     * @returns {DataFrame} A new DataFrame with the new column name.
+     * Rename one or more columns.
+     * @param {String | dict} Either a single columnName to rename or a dict of column name remappings. 
+     * @param {String | undefined } replacement name for the single case or undefined if a dict is provided.
+     * @returns {DataFrame} A new DataFrame with the new column names.
      * @example
      * df.rename('column1', 'columnRenamed')
+     * df.rename({'column1' : 'column1Renamed', 'column5' : 'column5Renamed'})
      */
-    rename(columnName, replacement) {
-        const newColumnNames = this[__columns__].map((column) =>
-            column === columnName ? replacement : column
-        );
+    
+    rename(param1, param2) {
+        if (arguments.length == 1) {
+            // renameMany
+            let replacements = param1;
+            if (replacements.constructor != Object) {
+                throw new WrongSchemaError(replacements, "dictionary");
+            }
+            var newColumnNames = this[__columns__].map(function (column) {
+                return column in replacements ? replacements[column] : column;
+            });
+            return this.renameAll(newColumnNames);
+        } else if (arguments.length == 2) {
+            let columnName = param1;
+            let replacement = param2;
+            var newColumnNames = this[__columns__].map(function (column) {
+                return column === columnName ? replacement : column;
+            });
         return this.renameAll(newColumnNames);
     }
-
+    }
     /**
      * Cast each column into a given type.
      * @param {Array} typeFunctions The functions used to cast columns.
@@ -717,18 +733,24 @@ class DataFrame {
     }
 
     /**
-     * Remove a single column.
-     * @param {String} columnName The column to drop.
-     * @returns {DataFrame} A new DataFrame without the dropped column.
+     * Remove one or more columns.
+     * @param {String | Array<string>} columnNames The columns to drop.
+     * @returns {DataFrame} A new DataFrame without the dropped columns.
      * @example
      * df.drop('column2')
+     * df.drop(['column2', 'column3'])
      */
-    drop(columnName) {
-        return this.__newInstance__(
-            this[__rows__].map((row) => row.delete(columnName)),
-            this[__columns__].filter((column) => column !== columnName)
+    drop(columnNames) {
+        if (!Array.isArray(columnNames)) {
+            columnNames = [columnNames];
+        }		
+        return this.__newInstance__(this[__rows__].map(function (row) {
+            columnNames.forEach(c => row = row.delete(c));
+            return row;
+            }), this[__columns__].filter((column) => !(columnNames.includes(column)))
         );
     }
+        
 
     /**
      * Chain maps and filters functions on DataFrame by optimizing their executions.
@@ -778,6 +800,30 @@ class DataFrame {
      * Filter DataFrame rows.
      * Alias of .filter()
      * @param {Function | Object} condition A filter function or a column/value object.
+     * @returns {Array<{index,Row}>} An array of the filtered rows with their corresponding indices.
+     * @example
+     * df.filterWithIndex(row => row.get('column1') >= 3)
+     * df.filterWithIndex({'column2': 5, 'column1': 3}))
+     */
+    filterWithIndex(condition) {
+        const func =
+            typeof condition === "object"
+                ? (row) =>
+                      Object.entries(condition)
+                          .map(([column, value]) =>
+                              Object.is(row.get(column), value)
+                          )
+                          .reduce((p, n) => p && n)
+                : condition;
+        const filteredRows = iter(this[__rows__], (row, i) =>
+            func(row, i) ? {'index' : i, 'row' : row} : false);
+        return filteredRows;
+      }
+
+      /**
+     * Filter DataFrame rows.
+     * Alias of .filter()
+     * @param {Function | Object} condition A filter function or a column/value object.
      * @returns {DataFrame} A new filtered DataFrame.
      * @example
      * df.where(row => row.get('column1') >= 3)
@@ -797,6 +843,19 @@ class DataFrame {
      */
     find(condition) {
         return this.filter(condition)[__rows__][0];
+    }
+
+    /**
+     * Find a row (the first met) based on a condition.
+     * @param {Function} func A function to apply on each row taking the row as parameter.
+     * @returns {'index':index, 'row' : Row} The targeted index and Row.
+     * @example
+     * df.find(row => row.get('column1') === 3)
+     * df.find({'column1': 3})
+     */
+    findWithIndex(condition) {
+        let rs = this.filterWithIndex(condition);
+        return rs.length > 0 ? rs[0] : undefined;
     }
 
     /**
@@ -1086,13 +1145,13 @@ class DataFrame {
      * @example
      * df.join(df2, 'column1', 'full')
      */
-    join(dfToJoin, columnNames, how = "inner") {
+    join(dfToJoin, columnNames, how = "inner", shouldDropDuplicates = true) {
         const joinMethods = {
-            inner: () => this.innerJoin(dfToJoin, columnNames),
-            full: () => this.fullJoin(dfToJoin, columnNames),
-            outer: () => this.outerJoin(dfToJoin, columnNames),
-            left: () => this.leftJoin(dfToJoin, columnNames),
-            right: () => this.rightJoin(dfToJoin, columnNames)
+            inner: () => this.innerJoin(dfToJoin, columnNames, shouldDropDuplicates),
+            full: () => this.fullJoin(dfToJoin, columnNames, shouldDropDuplicates),
+            outer: () => this.outerJoin(dfToJoin, columnNames, shouldDropDuplicates),
+            left: () => this.leftJoin(dfToJoin, columnNames, shouldDropDuplicates),
+            right: () => this.rightJoin(dfToJoin, columnNames, shouldDropDuplicates)
         };
         return joinMethods[how]();
     }
@@ -1107,8 +1166,8 @@ class DataFrame {
      * df.join(df2, 'id')
      * df.join(df2, 'id', 'inner')
      */
-    innerJoin(dfToJoin, columnNames) {
-        return this._join(dfToJoin, columnNames, ["in"]);
+    innerJoin(dfToJoin, columnNames, shouldDropDuplicates = true) {
+        return this._join(dfToJoin, columnNames, ["in"], shouldDropDuplicates);
     }
 
     /**
@@ -1120,8 +1179,8 @@ class DataFrame {
      * df.fullJoin(df2, 'id')
      * df.join(df2, 'id', 'full')
      */
-    fullJoin(dfToJoin, columnNames) {
-        return this._join(dfToJoin, columnNames, ["full", "full"]);
+    fullJoin(dfToJoin, columnNames, shouldDropDuplicates = true) {
+        return this._join(dfToJoin, columnNames, ["full", "full"], shouldDropDuplicates);
     }
 
     /**
@@ -1133,8 +1192,8 @@ class DataFrame {
      * df2.outerJoin(df2, 'id')
      * df2.join(df2, 'id', 'outer')
      */
-    outerJoin(dfToJoin, columnNames) {
-        return this.fullJoin(dfToJoin, columnNames);
+    outerJoin(dfToJoin, columnNames, shouldDropDuplicates = true) {
+        return this.fullJoin(dfToJoin, columnNames, shouldDropDuplicates);
     }
 
     /**
@@ -1146,8 +1205,8 @@ class DataFrame {
      * df.leftJoin(df2, 'id')
      * df.join(df2, 'id', 'left')
      */
-    leftJoin(dfToJoin, columnNames) {
-        return this._join(dfToJoin, columnNames, ["full", "in"]);
+    leftJoin(dfToJoin, columnNames, shouldDropDuplicates = true) {
+        return this._join(dfToJoin, columnNames, ["full", "in"], shouldDropDuplicates);
     }
 
     /**
@@ -1159,8 +1218,8 @@ class DataFrame {
      * df.rightJoin(df2, 'id')
      * df.join(df2, 'id', 'right')
      */
-    rightJoin(dfToJoin, columnNames) {
-        return this._join(dfToJoin, columnNames, ["in", "full"]);
+    rightJoin(dfToJoin, columnNames, shouldDropDuplicates = true) {
+        return this._join(dfToJoin, columnNames, ["in", "full"], shouldDropDuplicates);
     }
 
     /**
